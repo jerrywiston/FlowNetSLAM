@@ -1,1 +1,1 @@
-# FlowNetSLAM
+# XD Visual Odometry
