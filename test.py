@@ -157,6 +157,7 @@ def DepthSolver(p1, p2, M1, M2, kL):
     pt2 = np.matmul(np.linalg.inv(kL), np.array([p2[0], p2[1], 1]))
     A = np.concatenate([np.matmul(CrossMatrix(pt1), M1), np.matmul(CrossMatrix(pt2), M2)], axis=0)
     u,s,vt = np.linalg.svd(A)
+    #print(s)
     p3d = vt[3,:] / vt[3,3]
     return p3d
 
@@ -170,49 +171,79 @@ def TransformMatrix(R, T):
     M2 = np.linalg.inv(H)[0:3,0:4]
     return H, M1, M2
 
-def SelectRT(R1, R2, T1, T2, p1, p2, kL):
-    H, M1, M2 = TransformMatrix(R1, T1)
-    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
-    p3d2 = np.matmul(H,p3d1)
-    if(p3d1[2]>0 and p3d2[2]>0):
+def SelectRT(R1, R2, T1, T2, pts1, pts2, kL, size):
+    score = [0,0,0,0]
+    for i in range(size):
+        r = random.randint(0,pts1.shape[0]-1)
+        p1 = pts1[r]
+        p2 = pts2[r]
+        H, M1, M2 = TransformMatrix(R1, T1)
+        p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+        p3d2 = np.matmul(H,p3d1)
+        if(p3d1[2]>0 and p3d2[2]>0):
+            score[0] += 1
+        
+        H, M1, M2 = TransformMatrix(R2, T1)
+        p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+        p3d2 = np.matmul(H,p3d1)
+        if(p3d1[2]>0 and p3d2[2]>0):
+            score[1] += 1
+        
+        H, M1, M2 = TransformMatrix(R1, T2)
+        p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+        p3d2 = np.matmul(H,p3d1)
+        if(p3d1[2]>0 and p3d2[2]>0):
+            score[2] += 1
+        
+        H, M1, M2 = TransformMatrix(R2, T2)
+        p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+        p3d2 = np.matmul(H,p3d1)
+        if(p3d1[2]>0 and p3d2[2]>0):
+            score[3] += 1
+
+    print(score)
+    winner = np.argmax(np.asarray(score))
+    #print(winner)
+    if(winner == 0):
         return R1, T1
-    
-    H, M1, M2 = TransformMatrix(R2, T1)
-    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
-    p3d2 = np.matmul(H,p3d1)
-    if(p3d1[2]>0 and p3d2[2]>0):
+    elif(winner == 1):
         return R2, T1
-    
-    H, M1, M2 = TransformMatrix(R1, T2)
-    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
-    p3d2 = np.matmul(H,p3d1)
-    if(p3d1[2]>0 and p3d2[2]>0):
+    elif(winner == 2):
         return R1, T2
-    
-    H, M1, M2 = TransformMatrix(R2, T2)
-    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
-    p3d2 = np.matmul(H,p3d1)
-    if(p3d1[2]>0 and p3d2[2]>0):
+    else:
         return R2, T2
 
-    return -1
-
 def Get3dPoints(R, T, pts1, pts2, kL):
-    R, T = SelectRT(R1, R2, T1, T2, pts1[0]+10, pts2[0]+10, kL)
     H, M1, M2 = TransformMatrix(R,T)
     pts3d = []
-    print(pts1.shape)
     for i in range(pts1.shape[0]):
         p3d = DepthSolver(pts1[i]+10, pts2[i]+10, M1, M2, kL)
         pts3d.append(p3d)
 
     return np.asarray(pts3d)
 
+def Get3dPointsImg(R, T, flow, kL, mask):
+    H, M1, M2 = TransformMatrix(R,T)
+    pimg = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.float32)
+   
+    for i in range(flow.shape[1]):
+        for j in range(flow.shape[0]):
+            if(mask[j,i] == 0):
+                pimg[i,j] = 0
+                continue
+            print(i,j)
+            p1 = np.asarray([j+10,i+10], dtype=np.float32)
+            p2 = np.asarray([j+flow[i,j,0]+10, i+flow[i,j,1]+10], dtype=np.float32)
+            pimg[i,j] = DepthSolver(p1, p2, M1, M2, kL)[0:3]
+
+    return pimg
+
 # ========================== Disparity Optimize ==========================
 # TODO
 
 # ========================== Main Program ==========================
 if __name__ == '__main__':
+    USE_MASK = False
     for i in range(4):
         print("[Frame " + str(i) + "]")
         img1 = imgL[i]
@@ -223,26 +254,30 @@ if __name__ == '__main__':
         depth = fxL*n/abs(disp)
         
         #Calculate Mask
-        edgeMask = GetEdgeMask(depth, (5,5))
-        remapMask = GetRemapMask(img1, img2, flow[i], 1)
-        totalMask = OverlapMask([edgeMask, remapMask])
-        #totalMask = np.ones((512,512), dtype=np.float32)
+        if(USE_MASK == True):
+            edgeMask = GetEdgeMask(depth, (5,5))
+            remapMask = GetRemapMask(img1, img2, flow[i], 1)
+            totalMask = OverlapMask([edgeMask, remapMask])
+        else:
+            totalMask = np.ones((512,512), dtype=np.float32)
         
         #Pose Estimation
         rnum = 1000
         pts1, pts2 = GetRandMatch(flow[i,:,:], rnum, mask=totalMask)
         funMat, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
-        funMask = (np.abs(funMat) > 1e-3).astype(np.float32)
+        funMask = (np.abs(funMat) > 1e-2).astype(np.float32)
         funMat = funMat * funMask
-        match = drawMatches(img1, pts1[0:200], img2, pts2, ransacMask)
+
+        match = drawMatches(img1, pts1[0:300], img2, pts2, ransacMask)
         print(str(np.sum(ransacMask)) + "/" + str(rnum))
         R1, R2, T1, T2 = GetExtrinsic(funMat, kL)
-        #print(R1)
-        #print(R2)
+
         scale = np.linalg.norm(T1)
-        print(scale)
-        P = Get3dPoints(R1, T1, pts1, pts2, kL)
+        R, T = SelectRT(R1, R2, T1, T2, pts1+10, pts2+10, kL, 10)
+        P = Get3dPoints(R, T, pts1, pts2, kL)
         print(np.mean(P[:,0:3]*18 / scale, axis=0))
+        #pimg = Get3dPointsImg(R, T, flow[i], kL, totalMask)
+        #print(np.mean(pimg[:,0:3]*18 / scale, axis=0))
         
         #Pointcloud handle
         #pointCloud = GetPointCloud(img1, depth, totalMask, cxL, cyL, fxL)
