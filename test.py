@@ -12,31 +12,23 @@ for key in xd:
 # Camera parameter
 kL = xd["matrixL"]
 kR = xd["matrixR"]
-
-fxL = kL[0,0]
-fyL = kL[1,1]
-cxL = kL[0,2]
-cyL = kL[1,2]
-
-fxR = kR[0,0]
-fyR = kR[1,1]
-cxR = kR[0,2]
-cyR = kR[1,2]
-
 flow = xd["flow"]
 imgL = xd["imgL"]
 imgR = xd["imgR"]
+
+fxL, fyL, cxL, cyL = kL[0,0], kL[1,1], kL[0,2], kL[1,2]
+fxR, fyR, cxR, cyR = kR[0,0], kR[1,1], kR[0,2], kR[1,2]
 
 n = 18
 print(flow.shape)
 
 # ========================== Point Cloud Handling ==========================
 # Depth to pointcloud
-def GetPointCloud(img, depth, edgeMask, remapMask, cx, cy, f):
+def GetPointCloud(img, depth, mask, cx, cy, f):
     pointCloud = []
     for i in range(depth.shape[1]):
         for j in range(depth.shape[0]):
-            if(edgeMask[i,j]>100 or remapMask[i,j]>1.):
+            if(mask[i,j] == 0):
                 continue
             y = -(i - cy) / f * depth[i,j]
             x = (j - cx) / f * depth[i,j]
@@ -71,7 +63,7 @@ def PatchDiff(img1, img2, region):
     return imgDiff
 
 # Calculate Remapping Mask
-def GetRemapMask(img1, img2, flow):
+def GetRemapMask(img1, img2, flow, threshold):
     m = np.zeros((512,512,2), dtype=np.float32)
     for i in range(512):
         for j in range(512):
@@ -79,6 +71,7 @@ def GetRemapMask(img1, img2, flow):
 
     rmap = cv2.remap(img2, m[:,:,0] + flow[:,:,0], m[:,:,1] + flow[:,:,1], cv2.INTER_LINEAR)
     mapMask = PatchDiff(rmap, img1, 2)
+    mapMask = (mapMask < threshold).astype(np.float32)
     return mapMask
 
 # Calculate Edge Mask
@@ -86,25 +79,33 @@ def GetEdgeMask(depth, dilated):
     depth_int = np.uint8(depth)
     canny = cv2.Canny(depth_int, 50, 10)
     edgeMask = cv2.dilate(canny, np.ones(dilated))
+    edgeMask = (np.ones_like(edgeMask) - edgeMask/255).astype(np.float32)
     return edgeMask
+
+# Mask Overlap
+def OverlapMask(masks):
+    totalMask = np.ones(masks[0].shape, dtype=np.float32)
+    for i in range(len(masks)):
+        totalMask = totalMask * masks[i]
+    return totalMask
     
 # ========================== Pose Estimation ==========================
 # Get matching id
-def GetRandMatch(flow, edgeMask, remapMask, size):
+def GetRandMatch(flow, size, mask):
     count = 0
     pts1 = []
     pts2 = []
     while(True):
         rx = random.randint(0,flow.shape[0]-1)
         ry = random.randint(0,flow.shape[1]-1)
-        if(edgeMask[ry,rx]>100 or remapMask[ry,rx]>0.5):
+        if(mask[ry,rx] == 0):
             continue
         pts1.append([rx,ry])
         pts2.append([rx+flow[ry,rx,0], ry+flow[ry,rx,1]])        
         count += 1
         if(count >= size):
             break
-    return np.asarray(pts1), np.asarray(pts2)
+    return np.asarray(pts1, dtype=np.float32), np.asarray(pts2, dtype=np.float32)
 
 def drawMatches(img1, pts1, img2, pts2, mask):
     rows1 = img1.shape[0]
@@ -113,7 +114,7 @@ def drawMatches(img1, pts1, img2, pts2, mask):
     cols2 = img2.shape[1]
 
     out = np.zeros((max([rows1,rows2]),cols1+cols2,3), dtype='uint8')
-    out[:rows1, :cols1] = np.dstack([img1])
+    out[:rows1, :cols1] = np.dstack([img1]) 
     out[:rows2, cols1:] = np.dstack([img2])
 
     for i in range(pts1.shape[0]):
@@ -128,6 +129,85 @@ def drawMatches(img1, pts1, img2, pts2, mask):
 
     return out
 
+def GetExtrinsic(funMat, kL):
+    w = np.asarray([[0,-1,0],[1,0,0],[0,0,1]], dtype=np.float32)
+    essMat = np.matmul(np.matmul(np.transpose(kL), funMat), kL)
+    u,s,vt = np.linalg.svd(essMat)
+    R1 = np.matmul(np.matmul(u, w), vt)
+    R2 = np.matmul(np.matmul(u, np.transpose(w)), vt)
+
+    sigma = np.zeros((3,3), dtype=np.float32)
+    sigma[0,0], sigma[1,1], sigma[2,2] = s[0], s[1], s[2]
+    Tx1 = np.matmul(np.matmul(np.matmul(u, np.transpose(w)), sigma), np.transpose(u))
+    Tx2 = np.matmul(np.matmul(np.matmul(u, w), sigma), np.transpose(u))
+
+    T1 = np.asarray([-Tx1[2,1], Tx1[2,0], -Tx1[1,0]])
+    T2 = np.asarray([-Tx2[2,1], Tx2[2,0], -Tx2[1,0]])
+
+    return R1, R2, T1, T2
+
+def CrossMatrix(v):
+    vmat = np.zeros((3,3), dtype=np.float32)
+    vmat[1,2], vmat[0,2], vmat[0,1] = -v[0], v[1], -v[2] 
+    vmat[2,1], vmat[2,0], vmat[1,0] = v[0], -v[1], v[2] 
+    return vmat
+
+def DepthSolver(p1, p2, M1, M2, kL):
+    pt1 = np.matmul(np.linalg.inv(kL), np.array([p1[0], p1[1], 1]))
+    pt2 = np.matmul(np.linalg.inv(kL), np.array([p2[0], p2[1], 1]))
+    A = np.concatenate([np.matmul(CrossMatrix(pt1), M1), np.matmul(CrossMatrix(pt2), M2)], axis=0)
+    u,s,vt = np.linalg.svd(A)
+    p3d = vt[3,:] / vt[3,3]
+    return p3d
+
+def TransformMatrix(R, T):
+    H = np.zeros((4,4), dtype=np.float32)
+    H[0:3,0:3] = R
+    H[0:3,3] = T
+    H[3,3] = 1
+    M1 = np.zeros((3,4), dtype=np.float32)
+    M1[0,0], M1[1,1], M1[2,2] = 1,1,1
+    M2 = np.linalg.inv(H)[0:3,0:4]
+    return H, M1, M2
+
+def SelectRT(R1, R2, T1, T2, p1, p2, kL):
+    H, M1, M2 = TransformMatrix(R1, T1)
+    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+    p3d2 = np.matmul(H,p3d1)
+    if(p3d1[2]>0 and p3d2[2]>0):
+        return R1, T1
+    
+    H, M1, M2 = TransformMatrix(R2, T1)
+    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+    p3d2 = np.matmul(H,p3d1)
+    if(p3d1[2]>0 and p3d2[2]>0):
+        return R2, T1
+    
+    H, M1, M2 = TransformMatrix(R1, T2)
+    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+    p3d2 = np.matmul(H,p3d1)
+    if(p3d1[2]>0 and p3d2[2]>0):
+        return R1, T2
+    
+    H, M1, M2 = TransformMatrix(R2, T2)
+    p3d1 = DepthSolver(p1, p2, M1, M2, kL)
+    p3d2 = np.matmul(H,p3d1)
+    if(p3d1[2]>0 and p3d2[2]>0):
+        return R2, T2
+
+    return -1
+
+def Get3dPoints(R, T, pts1, pts2, kL):
+    R, T = SelectRT(R1, R2, T1, T2, pts1[0]+10, pts2[0]+10, kL)
+    H, M1, M2 = TransformMatrix(R,T)
+    pts3d = []
+    print(pts1.shape)
+    for i in range(pts1.shape[0]):
+        p3d = DepthSolver(pts1[i]+10, pts2[i]+10, M1, M2, kL)
+        pts3d.append(p3d)
+
+    return np.asarray(pts3d)
+
 # ========================== Disparity Optimize ==========================
 # TODO
 
@@ -135,30 +215,46 @@ def drawMatches(img1, pts1, img2, pts2, mask):
 if __name__ == '__main__':
     for i in range(4):
         print("[Frame " + str(i) + "]")
+        img1 = imgL[i]
+        img2 = imgR[i]
 
         #Calculate Depth
         disp = flow[i,:,:,0]
         depth = fxL*n/abs(disp)
-
+        
         #Calculate Mask
         edgeMask = GetEdgeMask(depth, (5,5))
-        remapMask = GetRemapMask(imgL[i], imgR[i], flow[i])
+        remapMask = GetRemapMask(img1, img2, flow[i], 1)
+        totalMask = OverlapMask([edgeMask, remapMask])
+        #totalMask = np.ones((512,512), dtype=np.float32)
         
         #Pose Estimation
-        pts1, pts2 = GetRandMatch(flow[i,:,:], edgeMask, remapMask, 200)
-        funMat, ransacMask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, param1=1)
-        print(funMat)
-        print(str(np.sum(ransacMask)) + "/200")
-        match = drawMatches(imgL[i], pts1, imgR[i], pts2, ransacMask)
- 
+        rnum = 1000
+        pts1, pts2 = GetRandMatch(flow[i,:,:], rnum, mask=totalMask)
+        funMat, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
+        funMask = (np.abs(funMat) > 1e-3).astype(np.float32)
+        funMat = funMat * funMask
+        match = drawMatches(img1, pts1[0:200], img2, pts2, ransacMask)
+        print(str(np.sum(ransacMask)) + "/" + str(rnum))
+        R1, R2, T1, T2 = GetExtrinsic(funMat, kL)
+        #print(R1)
+        #print(R2)
+        scale = np.linalg.norm(T1)
+        print(scale)
+        P = Get3dPoints(R1, T1, pts1, pts2, kL)
+        print(np.mean(P[:,0:3]*18 / scale, axis=0))
+        
         #Pointcloud handle
-        #pointCloud = GetPointCloud(imgL[i], depth, edgeMask, remapMask, cxL, cyL, fxL)
+        #pointCloud = GetPointCloud(img1, depth, totalMask, cxL, cyL, fxL)
         #WritePointCloud("pc_" + str(i) + ".txt", pointCloud)
 
         #CV show
-        cv2.imshow("Image", imgL[i])
-        cv2.imshow("Remap Mask", remapMask)
-        cv2.imshow("Edge Mask", edgeMask)
+        cv2.imshow("Image", img1)
+        #cv2.imshow("Remap Mask", remapMask)
+        #cv2.imshow("Edge Mask", edgeMask)
+        cv2.imshow("Total Mask", totalMask)
         cv2.imshow("Depth", depth/np.max(depth))
         cv2.imshow("Matches", match)
+        print("< Press Enter to continue ... >")
         cv2.waitKey(0)
+        #break
