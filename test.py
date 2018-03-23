@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 import pyopt
+import os
 
 # Load data
 xd = np.load("XD.npz")
@@ -20,7 +21,7 @@ fxL, fyL, cxL, cyL = kL[0,0], kL[1,1], kL[0,2], kL[1,2]
 fxR, fyR, cxR, cyR = kR[0,0], kR[1,1], kR[0,2], kR[1,2]
 
 n = 18
-print(flow.shape)
+#print(flow.shape)
 
 # ========================== Point Cloud Handling ==========================
 # Depth to pointcloud
@@ -225,25 +226,77 @@ def Get3dPoints(R, T, pts1, pts2, kL):
 def Get3dPointsImg(R, T, flow, kL, mask):
     H, M1, M2 = TransformMatrix(R,T)
     pimg = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.float32)
+    img1, img2 = GetCorrMap(flow, [10,10])
    
     for i in range(flow.shape[1]):
         for j in range(flow.shape[0]):
-            if(mask[j,i] == 0):
-                pimg[i,j] = 0
+            if(mask[i,j] == 0):
+                pimg[i,j] = np.array([0, 0, 0], dtype=np.float32)
                 continue
-            print(i,j)
-            p1 = np.asarray([j+10,i+10], dtype=np.float32)
-            p2 = np.asarray([j+flow[i,j,0]+10, i+flow[i,j,1]+10], dtype=np.float32)
+            p1 = img1[i,j]
+            p2 = img2[i,j]
             pimg[i,j] = DepthSolver(p1, p2, M1, M2, kL)[0:3]
 
     return pimg
 
-# ========================== Disparity Optimize ==========================
-# TODO
+def PointsImg2PointCloud(pimg, img):
+    pc = []
+    for i in range(pimg.shape[1]):
+        for j in range(pimg.shape[0]):
+            if(pimg[i,j,0] == 0 and pimg[i,j,1] == 0 and pimg[i,j,2] == 0):
+                continue
+            pc.append([pimg[i,j,0], -pimg[i,j,1], pimg[i,j,2], img[i,j,2]/255., img[i,j,1]/255., img[i,j,0]/255.])
+    
+    return np.array(pc)
+
+# ========================== Opticalflow Refinement ==========================
+def GetCorrMap(flow, bias):
+    img1 = np.zeros(flow.shape, dtype=np.float32)
+    img2 = np.zeros(flow.shape, dtype=np.float32)
+
+    for i in range(img1.shape[1]):
+        for j in range(img1.shape[0]):
+            img1[i,j] = np.asarray([j+bias[0], i+bias[1]], dtype=np.float32)
+            img2[i,j] = np.asarray([j+bias[0]+flow[i,j,0], i+bias[1]+flow[i,j,1]], dtype=np.float32)
+    
+    return img1, img2
+
+def OptimizeDelta(v1, v2):
+    a = v1[0]
+    b = v1[1]
+    c = v1[2]
+    u = v2[0]
+    v = v2[1]
+
+    delta1 = -(a*a*u + a*b*v + a*c)/(a**2 + b**2)
+    delta2 = -(a*b*u + b*b*v + b*c)/(a**2 + b**2)
+    delta = np.asarray([delta1, delta2], dtype=np.float32)
+    #print(delta)
+
+    return delta
+
+def FlowRefine(F, flow):
+    img2, img1 = GetCorrMap(flow, [10,10])
+    flowRe = np.copy(flow)
+    for i in range(img1.shape[1]):
+        for j in range(img2.shape[0]):
+            v1 = np.matmul(np.asarray([img1[i,j,0], img1[i,j,1], 1], dtype=np.float32), F)
+            v2 = np.asarray([img2[i,j,0], img2[i,j,1], 1], dtype=np.float32)
+            print(np.dot(v1,v2))
+            delta = OptimizeDelta(v1, v2)
+            print(np.dot(v1,v2+np.asarray([delta[0], delta[1], 0])))
+            print(delta)
+            print()
+            flowRe[i,j,0] += delta[0]
+            flowRe[i,j,1] += delta[1]
+            pass
+
+    return flowRe
+
 
 # ========================== Main Program ==========================
 if __name__ == '__main__':
-    USE_MASK = False
+    USE_MASK = True
     for i in range(4):
         print("[Frame " + str(i) + "]")
         img1 = imgL[i]
@@ -255,7 +308,7 @@ if __name__ == '__main__':
         
         #Calculate Mask
         if(USE_MASK == True):
-            edgeMask = GetEdgeMask(depth, (5,5))
+            edgeMask = GetEdgeMask(depth, (10,10))
             remapMask = GetRemapMask(img1, img2, flow[i], 1)
             totalMask = OverlapMask([edgeMask, remapMask])
         else:
@@ -264,9 +317,13 @@ if __name__ == '__main__':
         #Pose Estimation
         rnum = 1000
         pts1, pts2 = GetRandMatch(flow[i,:,:], rnum, mask=totalMask)
-        funMat, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
-        funMask = (np.abs(funMat) > 1e-2).astype(np.float32)
-        funMat = funMat * funMask
+        funMat_o, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
+        funMask = (np.abs(funMat_o) > 1e-2).astype(np.float32)
+        funMat = funMat_o * funMask
+
+        flowRe = FlowRefine(funMat_o, flow[i])
+        pts11, pts22 = GetRandMatch(flowRe, rnum, mask=totalMask)
+        match2 = drawMatches(img1, pts11[0:300], img2, pts22, ransacMask)
 
         match = drawMatches(img1, pts1[0:300], img2, pts2, ransacMask)
         print(str(np.sum(ransacMask)) + "/" + str(rnum))
@@ -276,8 +333,11 @@ if __name__ == '__main__':
         R, T = SelectRT(R1, R2, T1, T2, pts1+10, pts2+10, kL, 10)
         P = Get3dPoints(R, T, pts1, pts2, kL)
         print(np.mean(P[:,0:3]*18 / scale, axis=0))
-        #pimg = Get3dPointsImg(R, T, flow[i], kL, totalMask)
-        #print(np.mean(pimg[:,0:3]*18 / scale, axis=0))
+        
+        pimg = Get3dPointsImg(R, T, flow[i], kL, totalMask)
+        print(np.mean(pimg[:,0:3]*18 / scale, axis=(0,1)))
+        pc = PointsImg2PointCloud(pimg, img1)
+        WritePointCloud("pc_" + str(i) + ".txt", pc)
         
         #Pointcloud handle
         #pointCloud = GetPointCloud(img1, depth, totalMask, cxL, cyL, fxL)
@@ -285,11 +345,14 @@ if __name__ == '__main__':
 
         #CV show
         cv2.imshow("Image", img1)
-        #cv2.imshow("Remap Mask", remapMask)
-        #cv2.imshow("Edge Mask", edgeMask)
+        cv2.imshow("Remap Mask", remapMask)
+        cv2.imshow("Edge Mask", edgeMask)
         cv2.imshow("Total Mask", totalMask)
         cv2.imshow("Depth", depth/np.max(depth))
+        cv2.imshow("Depth2", pimg[:,:,2]/np.max(pimg[:,:,2]))
         cv2.imshow("Matches", match)
+        cv2.imshow("Matches2", match2)
+
         print("< Press Enter to continue ... >")
         cv2.waitKey(0)
         #break
