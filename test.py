@@ -202,9 +202,8 @@ def SelectRT(R1, R2, T1, T2, pts1, pts2, kL, size):
         if(p3d1[2]>0 and p3d2[2]>0):
             score[3] += 1
 
-    print(score)
+    #print(score)
     winner = np.argmax(np.asarray(score))
-    #print(winner)
     if(winner == 0):
         return R1, T1
     elif(winner == 1):
@@ -271,7 +270,6 @@ def OptimizeDelta(v1, v2):
     delta1 = -(a*a*u + a*b*v + a*c)/(a**2 + b**2)
     delta2 = -(a*b*u + b*b*v + b*c)/(a**2 + b**2)
     delta = np.asarray([delta1, delta2], dtype=np.float32)
-    #print(delta)
 
     return delta
 
@@ -282,16 +280,22 @@ def FlowRefine(F, flow):
         for j in range(img2.shape[0]):
             v1 = np.matmul(np.asarray([img1[i,j,0], img1[i,j,1], 1], dtype=np.float32), F)
             v2 = np.asarray([img2[i,j,0], img2[i,j,1], 1], dtype=np.float32)
-            print(np.dot(v1,v2))
+            #print(np.dot(v1,v2))
             delta = OptimizeDelta(v1, v2)
-            print(np.dot(v1,v2+np.asarray([delta[0], delta[1], 0])))
-            print(delta)
-            print()
+            #print(np.dot(v1,v2+np.asarray([delta[0], delta[1], 0])))
+            #print(delta)
+            #print()
             flowRe[i,j,0] += delta[0]
             flowRe[i,j,1] += delta[1]
-            pass
 
     return flowRe
+
+# ========================== Iterative Closest Points (ICP) ==========================
+def PointsPairAlign(pc1, pc2):
+    pass
+
+def ICP():
+    pass
 
 
 # ========================== Main Program ==========================
@@ -314,34 +318,34 @@ if __name__ == '__main__':
         else:
             totalMask = np.ones((512,512), dtype=np.float32)
         
-        #Pose Estimation
+        #Cauculate Fundamental Matrix
         rnum = 1000
         pts1, pts2 = GetRandMatch(flow[i,:,:], rnum, mask=totalMask)
-        funMat_o, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
-        funMask = (np.abs(funMat_o) > 1e-2).astype(np.float32)
-        funMat = funMat_o * funMask
+        funMat, ransacMask = cv2.findFundamentalMat(pts1+10, pts2+10, cv2.FM_RANSAC, param1=1)
+        funMask = (np.abs(funMat) > 1e-2).astype(np.float32)
+        funMat_clip = funMat * funMask
 
-        flowRe = FlowRefine(funMat_o, flow[i])
+        #Opticalflow Refinement
+        flowRe = FlowRefine(funMat, flow[i])
         pts11, pts22 = GetRandMatch(flowRe, rnum, mask=totalMask)
         match2 = drawMatches(img1, pts11[0:300], img2, pts22, ransacMask)
 
+        #Calculate Extrinsic
         match = drawMatches(img1, pts1[0:300], img2, pts2, ransacMask)
         print(str(np.sum(ransacMask)) + "/" + str(rnum))
-        R1, R2, T1, T2 = GetExtrinsic(funMat, kL)
+        R1, R2, T1, T2 = GetExtrinsic(funMat_clip, kL)
 
+        #Calculate 3d sparse points
         scale = np.linalg.norm(T1)
         R, T = SelectRT(R1, R2, T1, T2, pts1+10, pts2+10, kL, 10)
         P = Get3dPoints(R, T, pts1, pts2, kL)
         print(np.mean(P[:,0:3]*18 / scale, axis=0))
         
+        #Calculate whole pointcloud
         pimg = Get3dPointsImg(R, T, flow[i], kL, totalMask)
         print(np.mean(pimg[:,0:3]*18 / scale, axis=(0,1)))
         pc = PointsImg2PointCloud(pimg, img1)
         WritePointCloud("pc_" + str(i) + ".txt", pc)
-        
-        #Pointcloud handle
-        #pointCloud = GetPointCloud(img1, depth, totalMask, cxL, cyL, fxL)
-        #WritePointCloud("pc_" + str(i) + ".txt", pointCloud)
 
         #CV show
         cv2.imshow("Image", img1)
